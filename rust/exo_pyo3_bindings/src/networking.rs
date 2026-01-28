@@ -147,6 +147,10 @@ enum ToTask {
         data: Vec<u8>,
         result_tx: oneshot::Sender<PyResult<MessageId>>,
     },
+    DialPeer {
+        multiaddr: String,
+        result_tx: oneshot::Sender<PyResult<()>>,
+    },
 }
 
 #[allow(clippy::enum_glob_use)]
@@ -233,6 +237,25 @@ async fn networking_task(
                         // send response oneshot (or exit if connection closed)
                         if let Err(e) = result_tx.send(pyresult) {
                             log::error!("RUST: could not publish gossipsub message since channel already closed: {e:?}");
+                            continue;
+                        }
+                    }
+                    DialPeer { multiaddr, result_tx } => {
+                        // parse multiaddr and dial
+                        let result: PyResult<()> = match multiaddr.parse::<libp2p::Multiaddr>() {
+                            Ok(addr) => {
+                                log::info!("RUST: dialing peer at {}", addr);
+                                match swarm.dial(addr) {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("dial failed: {e}"))),
+                                }
+                            }
+                            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!("invalid multiaddr: {e}"))),
+                        };
+
+                        // send response oneshot (or exit if connection closed)
+                        if let Err(e) = result_tx.send(result) {
+                            log::error!("RUST: could not send dial result since channel already closed: {e:?}");
                             continue;
                         }
                     }
@@ -571,6 +594,30 @@ impl PyNetworkingHandle {
             .await
             .map_err(|_| PyErr::receiver_channel_closed())??;
         Ok(())
+    }
+
+    // ---- Peer dialing methods ----
+
+    /// Manually dial a peer at the given multiaddr.
+    ///
+    /// This is useful for manual peer bootstrap when mDNS discovery is not working.
+    /// The multiaddr should be in the format: /ip4/<ip>/tcp/<port>/p2p/<peer_id>
+    async fn dial_peer(&self, multiaddr: String) -> PyResult<()> {
+        let (tx, rx) = oneshot::channel();
+
+        // send off request to dial
+        self.to_task_tx()
+            .send_py(ToTask::DialPeer {
+                multiaddr,
+                result_tx: tx,
+            })
+            .allow_threads_py() // allow-threads-aware async call
+            .await?;
+
+        // wait for response & return any errors
+        rx.allow_threads_py() // allow-threads-aware async call
+            .await
+            .map_err(|_| PyErr::receiver_channel_closed())?
     }
 
     // ---- Gossipsub message receiver methods ----

@@ -1,3 +1,4 @@
+import os
 from copy import copy
 from itertools import count
 from math import inf
@@ -28,6 +29,10 @@ from exo.utils.pydantic_ext import CamelCaseModel
 
 from .connection_message import ConnectionMessage
 from .topics import CONNECTION_MESSAGES, PublishPolicy, TypedTopic
+
+# Environment variable for bootstrap peers (comma-separated multiaddrs)
+# Format: /ip4/<ip>/tcp/<port>/p2p/<peer_id>
+EXO_BOOTSTRAP_PEERS_ENV = "EXO_BOOTSTRAP_PEERS"
 
 
 # A significant current limitation of the TopicRouter is that it is not capable
@@ -147,6 +152,8 @@ class Router:
 
     async def run(self):
         logger.debug("Starting Router")
+        # Dial bootstrap peers if configured
+        await self._dial_bootstrap_peers()
         try:
             async with create_task_group() as tg:
                 self._tg = tg
@@ -162,6 +169,20 @@ class Router:
             with move_on_after(1, shield=True):
                 for topic in self.topic_routers:
                     await self._networking_unsubscribe(str(topic))
+
+    async def _dial_bootstrap_peers(self):
+        """Dial bootstrap peers from EXO_BOOTSTRAP_PEERS environment variable."""
+        peers_str = os.environ.get(EXO_BOOTSTRAP_PEERS_ENV, "").strip()
+        if not peers_str:
+            return
+
+        peers = [p.strip() for p in peers_str.split(",") if p.strip()]
+        for peer_addr in peers:
+            try:
+                logger.info(f"Dialing bootstrap peer: {peer_addr}")
+                await self._net.dial_peer(peer_addr)
+            except Exception as e:
+                logger.warning(f"Failed to dial bootstrap peer {peer_addr}: {e}")
 
     async def shutdown(self):
         logger.debug("Shutting down Router")
