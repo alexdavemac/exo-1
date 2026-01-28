@@ -242,26 +242,15 @@ async fn networking_task(
                     }
                     DialPeer { multiaddr, result_tx } => {
                         // parse multiaddr and dial
-                        eprintln!("RUST DIAL: parsing multiaddr: {}", multiaddr);
                         let result: PyResult<()> = match multiaddr.parse::<libp2p::Multiaddr>() {
                             Ok(addr) => {
-                                eprintln!("RUST DIAL: dialing peer at {}", addr);
                                 log::info!("RUST: dialing peer at {}", addr);
-                                match swarm.dial(addr.clone()) {
-                                    Ok(cid) => {
-                                        eprintln!("RUST DIAL: dial queued successfully, connection_id={:?}", cid);
-                                        Ok(())
-                                    },
-                                    Err(e) => {
-                                        eprintln!("RUST DIAL: dial failed: {}", e);
-                                        Err(pyo3::exceptions::PyRuntimeError::new_err(format!("dial failed: {e}")))
-                                    },
+                                match swarm.dial(addr) {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("dial failed: {e}"))),
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("RUST DIAL: invalid multiaddr: {}", e);
-                                Err(pyo3::exceptions::PyValueError::new_err(format!("invalid multiaddr: {e}")))
-                            },
+                            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!("invalid multiaddr: {e}"))),
                         };
 
                         // send response oneshot (or exit if connection closed)
@@ -344,7 +333,6 @@ async fn networking_task(
                         }
                     },
                     e => {
-                        eprintln!("RUST EVENT: {:?}", e);
                         log::info!("RUST: other event {e:?}");
                     }
                 }
