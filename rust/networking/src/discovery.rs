@@ -30,8 +30,8 @@ mod managed {
     use std::io;
     use std::time::Duration;
 
-    const MDNS_RECORD_TTL: Duration = Duration::from_millis(2_500);
-    const MDNS_QUERY_INTERVAL: Duration = Duration::from_millis(1_500);
+    const MDNS_RECORD_TTL: Duration = Duration::from_secs(60);
+    const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(30);
     const PING_TIMEOUT: Duration = Duration::from_millis(2_500);
     const PING_INTERVAL: Duration = Duration::from_millis(2_500);
 
