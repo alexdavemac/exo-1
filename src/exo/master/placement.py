@@ -38,6 +38,24 @@ from exo.shared.types.worker.instances import (
 )
 from exo.shared.types.worker.shards import Sharding
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _has_ios_node_in_cycle(
+    cycle: Cycle,
+    node_identity: Mapping[NodeId, NodeIdentity] | None,
+) -> bool:
+    """Check if any node in the cycle is an iOS device."""
+    if node_identity is None:
+        return False
+    for node_id in cycle.node_ids:
+        identity = node_identity.get(node_id)
+        if identity is not None and identity.platform == "ios":
+            return True
+    return False
+
 
 def random_ephemeral_port() -> int:
     port = random.randint(49153, 65535)

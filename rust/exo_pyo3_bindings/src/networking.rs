@@ -21,7 +21,10 @@ use pyo3::types::PyBytes;
 use pyo3::{Bound, Py, PyErr, PyResult, PyTraverseError, PyVisit, Python, pymethods};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 mod exception {
     use pyo3::types::PyTuple;
@@ -152,6 +155,7 @@ async fn networking_task(
     mut to_task_rx: mpsc::Receiver<ToTask>,
     connection_update_tx: mpsc::Sender<PyConnectionUpdate>,
     gossipsub_message_tx: mpsc::Sender<(String, Vec<u8>)>,
+    shutdown_signal: Arc<AtomicBool>,
 ) {
     use SwarmEvent::*;
     use ToTask::*;
@@ -160,7 +164,28 @@ async fn networking_task(
 
     log::info!("RUST: networking task started");
 
+    // Wrap senders in Option so we can explicitly drop them before the task exits.
+    // This prevents the drop from happening during task cleanup when Python may be gone.
+    let mut connection_update_tx = Some(connection_update_tx);
+    let mut gossipsub_message_tx = Some(gossipsub_message_tx);
+
+    // Helper macro to get sender or break if already dropped
+    macro_rules! get_sender {
+        ($sender:expr) => {
+            match $sender.as_ref() {
+                Some(s) => s,
+                None => break,
+            }
+        };
+    }
+
     loop {
+        // Check shutdown signal first
+        if shutdown_signal.load(Ordering::Relaxed) {
+            log::info!("RUST: shutdown signal received");
+            break;
+        }
+
         tokio::select! {
             message = to_task_rx.recv() => {
                 // handle closed channel
@@ -234,7 +259,8 @@ async fn networking_task(
                         let message = (topic.into_string(), data);
 
                         // send incoming message to channel (or exit if connection closed)
-                        if let Err(e) = gossipsub_message_tx.send(message).await {
+                        let sender = get_sender!(gossipsub_message_tx);
+                        if let Err(e) = sender.send(message).await {
                             log::error!("RUST: could not send incoming gossipsub message since channel already closed: {e}");
                             continue;
                         }
@@ -250,7 +276,8 @@ async fn networking_task(
                         };
 
                         // send connection event to channel (or exit if connection closed)
-                        if let Err(e) = connection_update_tx.send(PyConnectionUpdate {
+                        let sender = get_sender!(connection_update_tx);
+                        if let Err(e) = sender.send(PyConnectionUpdate {
                             update_type: PyConnectionUpdateType::Connected,
                             peer_id: PyPeerId(peer_id),
                             remote_ipv4,
@@ -271,7 +298,8 @@ async fn networking_task(
                         };
 
                         // send disconnection event to channel (or exit if connection closed)
-                        if let Err(e) = connection_update_tx.send(PyConnectionUpdate {
+                        let sender = get_sender!(connection_update_tx);
+                        if let Err(e) = sender.send(PyConnectionUpdate {
                             update_type: PyConnectionUpdateType::Disconnected,
                             peer_id: PyPeerId(peer_id),
                             remote_ipv4,
@@ -289,6 +317,18 @@ async fn networking_task(
         }
     }
 
+    // Explicitly forget the senders to prevent them from being dropped.
+    // When senders are dropped, they wake up receivers which may use Python wakers.
+    // If Python has already finalized (which can happen during process exit),
+    // this would cause a panic. By forgetting them, we accept a small memory leak
+    // at process exit in exchange for crash-free shutdown.
+    if let Some(tx) = connection_update_tx.take() {
+        std::mem::forget(tx);
+    }
+    if let Some(tx) = gossipsub_message_tx.take() {
+        std::mem::forget(tx);
+    }
+
     log::info!("RUST: networking task stopped");
 }
 
@@ -300,14 +340,27 @@ struct PyNetworkingHandle {
     to_task_tx: Option<mpsc::Sender<ToTask>>,
     connection_update_rx: Mutex<mpsc::Receiver<PyConnectionUpdate>>,
     gossipsub_message_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
+    // shutdown coordination
+    shutdown_signal: Arc<AtomicBool>,
+    task_handle: Option<JoinHandle<()>>,
 }
 
 impl Drop for PyNetworkingHandle {
     fn drop(&mut self) {
-        // TODO: may or may not need to await a "kill-signal" oneshot channel message,
-        //       to ensure that the networking task is done BEFORE exiting the clear function...
-        //       but this may require GIL?? and it may not be safe to call GIL here??
-        self.to_task_tx = None; // Using Option<T> as a trick to force channel to be dropped
+        // Signal the networking task to shut down
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+
+        // Drop the sender to unblock any waiting receivers in the task
+        self.to_task_tx = None;
+
+        // Intentionally leak the task handle to prevent cleanup code from running.
+        // This is necessary because when the tokio runtime shuts down after Python
+        // has finalized, dropping the task would trigger wakers that try to interact
+        // with Python, causing a panic. The memory leak is acceptable because this
+        // only happens once at process exit.
+        if let Some(handle) = self.task_handle.take() {
+            std::mem::forget(handle);
+        }
     }
 }
 
@@ -317,11 +370,15 @@ impl PyNetworkingHandle {
         to_task_tx: mpsc::Sender<ToTask>,
         connection_update_rx: mpsc::Receiver<PyConnectionUpdate>,
         gossipsub_message_rx: mpsc::Receiver<(String, Vec<u8>)>,
+        shutdown_signal: Arc<AtomicBool>,
+        task_handle: JoinHandle<()>,
     ) -> Self {
         Self {
             to_task_tx: Some(to_task_tx),
             connection_update_rx: Mutex::new(connection_update_rx),
             gossipsub_message_rx: Mutex::new(gossipsub_message_rx),
+            shutdown_signal,
+            task_handle: Some(task_handle),
         }
     }
 
@@ -350,6 +407,10 @@ impl PyNetworkingHandle {
         let (connection_update_tx, connection_update_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
         let (gossipsub_message_tx, gossipsub_message_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
 
+        // create shutdown signal
+        let shutdown_signal = Arc::new(AtomicBool::new(false));
+        let shutdown_signal_clone = shutdown_signal.clone();
+
         // get identity
         let identity = identity.borrow().0.clone();
 
@@ -359,12 +420,13 @@ impl PyNetworkingHandle {
             .pyerr()?;
 
         // spawn tokio task running the networking logic
-        get_runtime().spawn(async move {
+        let task_handle = get_runtime().spawn(async move {
             networking_task(
                 swarm,
                 to_task_rx,
                 connection_update_tx,
                 gossipsub_message_tx,
+                shutdown_signal_clone,
             )
             .await;
         });
@@ -372,6 +434,8 @@ impl PyNetworkingHandle {
             to_task_tx,
             connection_update_rx,
             gossipsub_message_rx,
+            shutdown_signal,
+            task_handle,
         ))
     }
 
@@ -382,10 +446,16 @@ impl PyNetworkingHandle {
 
     #[gen_stub(skip)]
     fn __clear__(&mut self) {
-        // TODO: may or may not need to await a "kill-signal" oneshot channel message,
-        //       to ensure that the networking task is done BEFORE exiting the clear function...
-        //       but this may require GIL?? and it may not be safe to call GIL here??
-        self.to_task_tx = None; // Using Option<T> as a trick to force channel to be dropped
+        // Signal the networking task to shut down
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+
+        // Drop the sender to unblock any waiting receivers in the task
+        self.to_task_tx = None;
+
+        // Abort the task immediately to prevent it from trying to interact with Python
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
     }
 
     // ---- Connection update receiver methods ----
