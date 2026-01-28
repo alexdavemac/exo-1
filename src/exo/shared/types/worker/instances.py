@@ -27,6 +27,7 @@ class BaseInstance(TaggedModel):
 class MlxRingInstance(BaseInstance):
     hosts_by_node: dict[NodeId, list[Host]]
     ephemeral_port: int
+    has_ios_node: bool = False  # True when iOS device is in cluster (uses EXOT protocol)
 
 
 class MlxJacclInstance(BaseInstance):

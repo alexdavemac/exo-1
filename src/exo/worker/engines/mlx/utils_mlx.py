@@ -59,9 +59,18 @@ from exo.worker.engines.mlx.auto_parallel import (
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
+from exo.worker.engines.mlx.exot_pipeline import (
+    ExotClient,
+    initialize_exot_pipeline,
+    shutdown_exot_pipeline,
+    exot_pipeline_auto_parallel,
+)
 from exo.worker.runner.bootstrap import logger
 
 Group = mx.distributed.Group
+
+# Global EXOT mode flag - set when iOS node is detected
+_exot_mode_active: bool = False
 
 
 # TODO: Test this
@@ -113,14 +122,94 @@ class HostList(RootModel[list[str]]):
         return cls(root=[str(host) for host in hosts])
 
 
+def _get_ios_node_info(
+    bound_instance: BoundInstance,
+) -> tuple[str | None, int | None, str | None]:
+    """
+    Get iOS node connection info from the instance.
+    
+    Returns:
+        Tuple of (ios_host, ios_port, ios_node_id) or (None, None, None) if no iOS node.
+    """
+    if not isinstance(bound_instance.instance, MlxRingInstance):
+        return None, None, None
+    
+    if not bound_instance.instance.has_ios_node:
+        return None, None, None
+    
+    hosts_by_node = bound_instance.instance.hosts_by_node
+    ephemeral_port = bound_instance.instance.ephemeral_port
+    our_node_id = bound_instance.bound_node_id
+    
+    # Find a node that isn't us (the iOS node)
+    for node_id, hosts in hosts_by_node.items():
+        if node_id == our_node_id:
+            continue
+        # Get the first non-local IP for this node
+        for host in hosts:
+            if host.ip not in ("0.0.0.0", "127.0.0.1", "localhost"):
+                return host.ip, ephemeral_port, node_id
+    
+    return None, None, None
+
+
 def mlx_distributed_init(
     bound_instance: BoundInstance,
-) -> Group:
+) -> Group | None:
     """
-    Initialize MLX distributed.
+    Initialize MLX distributed or EXOT pipeline for iOS.
+
+    Returns:
+        Group for standard MLX distributed, or None for EXOT mode (iOS pipeline).
     """
+    global _exot_mode_active
+
     rank = bound_instance.bound_shard.device_rank
     logger.info(f"Starting initialization for rank {rank}")
+
+    # Check for iOS nodes - use EXOT protocol instead of MLX distributed
+    ios_host, ios_port, ios_node_id = _get_ios_node_info(bound_instance)
+    if ios_host is not None and ios_port is not None:
+        logger.info(f"[EXOT] iOS node detected at {ios_host}:{ios_port} (node_id: {ios_node_id})")
+
+        # Get shard info for EXOT initialization
+        shard = bound_instance.bound_shard
+        if isinstance(shard, PipelineShardMetadata):
+            local_start = shard.start_layer
+            local_end = shard.end_layer
+            total_layers = shard.n_layers
+
+            # Assume iOS handles the complement of our layers
+            # If we handle first half, iOS handles second half, and vice versa
+            if local_start == 0:
+                ios_start = local_end
+                ios_end = total_layers
+            else:
+                ios_start = 0
+                ios_end = local_start
+
+            success = initialize_exot_pipeline(
+                ios_host=ios_host,
+                ios_port=ios_port,
+                instance_id=str(bound_instance.instance.instance_id),
+                model_id=str(shard.model_card.model_id),
+                local_start_layer=local_start,
+                local_end_layer=local_end,
+                ios_start_layer=ios_start,
+                ios_end_layer=ios_end,
+                local_rank=rank,
+                world_size=2,  # Mac + iOS
+            )
+
+            if success:
+                _exot_mode_active = True
+                logger.info("[EXOT] Pipeline initialized - using EXOT protocol for iOS communication")
+                return None  # Signal EXOT mode
+            else:
+                logger.error("[EXOT] Failed to initialize pipeline - falling back to standard mode")
+                # Fall through to standard initialization
+        else:
+            logger.warning("[EXOT] iOS node detected but not in pipeline mode - using standard initialization")
 
     coordination_file = None
     try:
@@ -182,7 +271,13 @@ def mlx_distributed_init(
 
 def initialize_mlx(
     bound_instance: BoundInstance,
-) -> Group:
+) -> Group | None:
+    """
+    Initialize MLX for distributed inference.
+
+    Returns:
+        Group for standard MLX distributed, or None for EXOT mode (iOS pipeline).
+    """
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)
@@ -198,7 +293,20 @@ def load_mlx_items(
     group: Group | None,
     on_timeout: TimeoutCallback | None = None,
 ) -> tuple[Model, TokenizerWrapper]:
-    if group is None:
+    global _exot_mode_active
+
+    # EXOT mode: group is None but we need distributed loading via EXOT protocol
+    if group is None and _exot_mode_active:
+        logger.info("[EXOT] Starting EXOT distributed init")
+        start_time = time.perf_counter()
+        model, tokenizer = shard_and_load(
+            bound_instance.bound_shard, group=None, on_timeout=on_timeout
+        )
+        end_time = time.perf_counter()
+        logger.info(
+            f"[EXOT] Time taken to shard and load model: {(end_time - start_time):.2f}s"
+        )
+    elif group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
@@ -206,7 +314,6 @@ def load_mlx_items(
         end_time = time.perf_counter()
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
-
     else:
         logger.info("Starting distributed init")
         start_time = time.perf_counter()
@@ -225,9 +332,11 @@ def load_mlx_items(
 
 def shard_and_load(
     shard_metadata: ShardMetadata,
-    group: Group,
+    group: Group | None,
     on_timeout: TimeoutCallback | None = None,
 ) -> tuple[nn.Module, TokenizerWrapper]:
+    global _exot_mode_active
+
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
     model, _ = load_model(model_path, lazy=True, strict=False)
@@ -253,12 +362,35 @@ def shard_and_load(
 
     tokenizer = get_tokenizer(model_path, shard_metadata)
 
-    logger.info(f"Group size: {group.size()}, group rank: {group.rank()}")
-
     # Estimate timeout based on model size (5x default for large queued workloads)
     base_timeout = float(os.environ.get("EXO_MODEL_LOAD_TIMEOUT", "300"))
     model_size_gb = get_weights_size(shard_metadata).in_bytes / (1024**3)
     timeout_seconds = base_timeout + model_size_gb
+
+    # EXOT mode: use EXOT pipeline for iOS communication
+    if _exot_mode_active and group is None:
+        logger.info(f"[EXOT] Loading model from {model_path} with EXOT pipeline parallelism")
+        logger.info(
+            f"Evaluating model parameters with timeout of {timeout_seconds:.0f}s "
+            f"(model size: {model_size_gb:.1f}GB)"
+        )
+
+        if isinstance(shard_metadata, PipelineShardMetadata):
+            model = exot_pipeline_auto_parallel(model, shard_metadata)
+            eval_with_timeout(model.parameters(), timeout_seconds, on_timeout)
+        else:
+            logger.warning("[EXOT] Non-pipeline shard with EXOT mode - loading as single device")
+
+        mx.eval(model)
+        logger.debug("SHARDED (EXOT)")
+        logger.debug(model)
+        return model, tokenizer
+
+    # Standard MLX distributed mode
+    if group is None:
+        raise ValueError("Group is None but EXOT mode is not active")
+
+    logger.info(f"Group size: {group.size()}, group rank: {group.rank()}")
     logger.info(
         f"Evaluating model parameters with timeout of {timeout_seconds:.0f}s "
         f"(model size: {model_size_gb:.1f}GB)"
@@ -586,6 +718,13 @@ def set_wired_limit_for_model(model_size: Memory):
 def mlx_cleanup(
     model: Model | None, tokenizer: TokenizerWrapper | None, group: Group | None
 ) -> None:
+    global _exot_mode_active
+
+    # Shutdown EXOT if it was active
+    if _exot_mode_active:
+        shutdown_exot_pipeline()
+        _exot_mode_active = False
+
     del model, tokenizer, group
     mx.clear_cache()
     import gc

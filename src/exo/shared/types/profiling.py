@@ -83,6 +83,7 @@ class NodeIdentity(CamelCaseModel):
     friendly_name: str = "Unknown"
     os_version: str = "Unknown"
     os_build_version: str = "Unknown"
+    platform: str = "darwin"  # darwin, ios, linux, windows
 
 
 class NodeNetworkInfo(CamelCaseModel):

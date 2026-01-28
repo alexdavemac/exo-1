@@ -24,7 +24,7 @@ from exo.shared.types.commands import (
 from exo.shared.types.common import NodeId
 from exo.shared.types.events import Event, InstanceCreated, InstanceDeleted
 from exo.shared.types.memory import Memory
-from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
+from exo.shared.types.profiling import MemoryUsage, NodeIdentity, NodeNetworkInfo
 from exo.shared.types.worker.downloads import (
     DownloadOngoing,
     DownloadProgress,
@@ -61,6 +61,7 @@ def place_instance(
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
     required_nodes: set[NodeId] | None = None,
+    node_identity: Mapping[NodeId, NodeIdentity] | None = None,
 ) -> dict[InstanceId, Instance]:
     cycles = topology.get_cycles()
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
@@ -123,8 +124,21 @@ def place_instance(
         ),
     )
 
+    # Check for iOS nodes and force pipeline parallelism if found
+    has_ios_node = _has_ios_node_in_cycle(selected_cycle, node_identity)
+    effective_sharding = command.sharding
+    
+    if has_ios_node:
+        if command.sharding == Sharding.Tensor:
+            logger.warning(
+                "[iOS] iOS node detected - forcing pipeline parallelism (EXOT protocol)"
+            )
+            effective_sharding = Sharding.Pipeline
+        else:
+            logger.info("[iOS] iOS node detected - using pipeline parallelism")
+
     shard_assignments = get_shard_assignments(
-        command.model_card, selected_cycle, command.sharding, node_memory
+        command.model_card, selected_cycle, effective_sharding, node_memory
     )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)
@@ -167,6 +181,7 @@ def place_instance(
                 shard_assignments=shard_assignments,
                 hosts_by_node=hosts_by_node,
                 ephemeral_port=ephemeral_port,
+                has_ios_node=has_ios_node,
             )
 
     return target_instances
