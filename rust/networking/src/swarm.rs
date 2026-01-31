@@ -44,13 +44,19 @@ mod transport {
     static PNET_PRESHARED_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
         let builder = Sha3_256::new().update(b"exo_discovery_network");
 
-        if let Ok(var) = env::var(OVERRIDE_VERSION_ENV_VAR) {
+        let psk = if let Ok(var) = env::var(OVERRIDE_VERSION_ENV_VAR) {
+            eprintln!("PSK DEBUG: Using namespace from env: '{}'", var);
             let bytes = var.into_bytes();
             builder.update(&bytes)
         } else {
+            eprintln!("PSK DEBUG: Using default NETWORK_VERSION: '{}'", String::from_utf8_lossy(NETWORK_VERSION));
             builder.update(NETWORK_VERSION)
         }
-        .finalize()
+        .finalize();
+
+        eprintln!("PSK DEBUG: Computed PSK first 8 bytes: {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                  psk[0], psk[1], psk[2], psk[3], psk[4], psk[5], psk[6], psk[7]);
+        psk
     });
 
     /// Make the Swarm run on a private network, as to not clash with public libp2p nodes and
