@@ -23,6 +23,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.models.model_cards import ModelId
 from exo.worker.engines.mlx.constants import (
+    MODELS_REQUIRING_TRUST_REMOTE_CODE,
     TRUST_REMOTE_CODE,
 )
 
@@ -513,9 +514,10 @@ def load_tokenizer_for_model_id(
         hf_tokenizer.encode = _patched_encode
         return TokenizerWrapper(hf_tokenizer, eos_token_ids=eos_token_ids)
 
+    trust_remote = TRUST_REMOTE_CODE or str(model_id) in MODELS_REQUIRING_TRUST_REMOTE_CODE
     tokenizer = load_tokenizer(
         model_path,
-        tokenizer_config_extra={"trust_remote_code": TRUST_REMOTE_CODE},
+        tokenizer_config_extra={"trust_remote_code": trust_remote},
         eos_token_ids=eos_token_ids,
     )
 

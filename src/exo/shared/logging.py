@@ -46,9 +46,17 @@ class _InterceptHandler(logging.Handler):
 def logger_setup(log_file: Path | None, verbosity: int = 0):
     """Set up logging for this process - formatting, file handles, verbosity and output"""
 
-    logging.getLogger("exo_pyo3_bindings").setLevel(logging.WARNING)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # Suppress noisy third-party loggers
+    for noisy_logger in [
+        "exo_pyo3_bindings",
+        "httpx",
+        "httpcore",
+        "urllib3",
+        "asyncio",
+        "watchfiles",
+        "huggingface_hub",
+    ]:
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     logger.remove()
 

@@ -342,7 +342,7 @@ class Master:
                                 await self._send_event(IndexedEvent(idx=i, event=event))
                     for event in generated_events:
                         await self.event_sender.send(event)
-                except ValueError as e:
+                except Exception as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands

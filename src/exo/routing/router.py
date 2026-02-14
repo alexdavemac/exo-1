@@ -150,6 +150,10 @@ class Router:
 
         return recv
 
+    def get_listen_addresses(self) -> list[str]:
+        """Returns the libp2p listen addresses as multiaddr strings."""
+        return self._net.get_listen_addresses()
+
     async def run(self):
         logger.debug("Starting Router")
         # Dial bootstrap peers if configured

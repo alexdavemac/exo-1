@@ -21,6 +21,8 @@ from hypercorn.asyncio import serve  # pyright: ignore[reportUnknownVariableType
 from hypercorn.config import Config
 from hypercorn.typing import ASGIFramework
 from loguru import logger
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as StarletteResponse
 
 from exo.master.adapters.chat_completions import (
     chat_request_to_text_generation,
@@ -151,6 +153,46 @@ from exo.utils.event_buffer import OrderedBuffer
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 
 
+import os as _os
+
+# ─── API Key Auth Middleware ───────────────────────────────────────────────
+# Set EXO_API_KEY to enable auth. Without it, the API remains open (local-only).
+_EXO_API_KEY = _os.environ.get("EXO_API_KEY", "")
+# Paths that never require auth (dashboard assets, health, discovery)
+_PUBLIC_PATHS = frozenset({"/", "/node_id", "/health", "/dial_addresses"})
+
+
+class ExoApiKeyMiddleware(BaseHTTPMiddleware):
+    """Reject requests that lack a valid Bearer token or x-api-key header."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not _EXO_API_KEY:
+            return await call_next(request)
+
+        path = request.url.path
+        # Allow dashboard assets and public endpoints
+        if path in _PUBLIC_PATHS or path.startswith("/assets") or path.startswith("/static"):
+            return await call_next(request)
+
+        # Check Authorization: Bearer <key> or X-API-Key: <key>
+        auth_header = request.headers.get("authorization", "")
+        api_key_header = request.headers.get("x-api-key", "")
+
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        elif api_key_header:
+            token = api_key_header.strip()
+
+        if token != _EXO_API_KEY:
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"message": "Invalid or missing API key", "type": "Unauthorized", "code": 401}},
+            )
+
+        return await call_next(request)
+
+
 def _format_to_content_type(image_format: Literal["png", "jpeg", "webp"] | None) -> str:
     return f"image/{image_format or 'png'}"
 
@@ -177,6 +219,8 @@ class API:
         download_command_sender: Sender[ForwarderDownloadCommand],
         # This lets us pause the API if an election is running
         election_receiver: Receiver[ElectionMessage],
+        # Optional callable to get libp2p listen addresses from the router
+        get_listen_addresses: Callable[[], list[str]] | None = None,
     ) -> None:
         self.state = State()
         self._event_log = DiskEventLog(_API_EVENT_LOG_DIR)
@@ -189,6 +233,7 @@ class API:
         self.session_id: SessionId = session_id
         self.last_completed_election: int = 0
         self.port = port
+        self._get_listen_addresses = get_listen_addresses
 
         self.paused: bool = False
         self.paused_ev: anyio.Event = anyio.Event()
@@ -205,6 +250,12 @@ class API:
 
         self._setup_exception_handlers()
         self._setup_cors()
+        # API key auth — enabled when EXO_API_KEY env var is set
+        if _EXO_API_KEY:
+            self.app.add_middleware(ExoApiKeyMiddleware)
+            logger.info("API key authentication enabled")
+        else:
+            logger.warning("No EXO_API_KEY set — API is unauthenticated (local access only)")
         self._setup_routes()
 
         self.app.mount(
@@ -259,12 +310,16 @@ class API:
         return JSONResponse(err.model_dump(), status_code=exc.status_code)
 
     def _setup_cors(self) -> None:
+        allowed_origins = _os.environ.get(
+            "EXO_CORS_ORIGINS",
+            "*" if not _EXO_API_KEY else "http://localhost:*,https://localhost:*"
+        ).split(",")
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
+            allow_origins=allowed_origins,
             allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["Content-Type", "Authorization", "X-API-Key"],
         )
 
     def _setup_routes(self) -> None:
@@ -296,6 +351,7 @@ class API:
         self.app.post("/v1/responses", response_model=None)(self.openai_responses)
         self.app.get("/state")(lambda: self.state)
         self.app.get("/events")(self.stream_events)
+        self.app.get("/dial_addresses")(self.get_dial_addresses)
         self.app.post("/download/start")(self.start_download)
         self.app.delete("/download/{node_id}/{model_id:path}")(self.delete_download)
         self.app.get("/v1/traces")(self.list_traces)
@@ -1268,6 +1324,54 @@ class API:
             total_available += memory.ram_available
 
         return total_available
+
+    _dial_addresses: list[str] = []
+
+    def set_dial_addresses(self, addresses: list[str]) -> None:
+        """Set the dial addresses for this node."""
+        self._dial_addresses = addresses
+
+    async def get_dial_addresses(self):
+        """Returns libp2p dial addresses for this node.
+
+        Addresses are obtained from:
+        1. NetworkingHandle's listen addresses (automatically discovered)
+        2. set_dial_addresses() method (manual override)
+        3. EXO_DIAL_ADDRESSES environment variable (comma-separated, fallback)
+        """
+        import os
+
+        addresses: list[str] = []
+
+        # First, get listen addresses from the networking layer
+        if self._get_listen_addresses is not None:
+            try:
+                listen_addrs = self._get_listen_addresses()
+                # Add peer ID to make them dialable
+                peer_id = str(self.node_id)
+                for addr in listen_addrs:
+                    dial_addr = f"{addr}/p2p/{peer_id}"
+                    if dial_addr not in addresses:
+                        addresses.append(dial_addr)
+            except Exception as e:
+                import logging
+
+                logging.warning(f"Failed to get listen addresses: {e}")
+
+        # Also include manually set addresses
+        for addr in self._dial_addresses:
+            if addr not in addresses:
+                addresses.append(addr)
+
+        # Also check environment variable as fallback
+        env_addrs = os.environ.get("EXO_DIAL_ADDRESSES", "")
+        if env_addrs:
+            for addr in env_addrs.split(","):
+                addr = addr.strip()
+                if addr and addr not in addresses:
+                    addresses.append(addr)
+
+        return {"addresses": addresses, "node_id": str(self.node_id)}
 
     async def get_models(self) -> ModelList:
         """Returns list of available models."""

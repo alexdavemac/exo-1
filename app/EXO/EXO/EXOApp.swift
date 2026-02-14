@@ -30,11 +30,14 @@ struct EXOApp: App {
         terminationObserver = TerminationObserver {
             Task { @MainActor in
                 controller.cancelPendingLaunch()
-                controller.stop()
+                if !controller.isMonitoringExternal {
+                    controller.stop()
+                }
             }
         }
         _controller = StateObject(wrappedValue: controller)
-        let service = ClusterStateService()
+        // Use controller's configurable port for ClusterStateService
+        let service = ClusterStateService(baseURL: controller.apiBaseURL)
         _stateService = StateObject(wrappedValue: service)
         let networkStatus = NetworkStatusService()
         _networkStatusService = StateObject(wrappedValue: networkStatus)
@@ -48,7 +51,10 @@ struct EXOApp: App {
         NetworkSetupHelper.promptAndInstallIfNeeded()
         // Check local network access periodically (warning disappears when user grants permission)
         localNetwork.startPeriodicChecking(interval: 10)
-        controller.scheduleLaunch(after: 15)
+        // Smart launch: check for external instance before starting subprocess
+        Task {
+            await controller.smartLaunch()
+        }
         service.startPolling()
         networkStatus.startPolling()
     }
@@ -71,9 +77,21 @@ struct EXOApp: App {
     private var menuBarIcon: some View {
         let baseImage = resizedMenuBarIcon(named: "menubar-icon", size: 26)
         let iconImage: NSImage
-        if controller.status == .stopped, let grey = greyscale(image: baseImage) {
-            iconImage = grey
-        } else {
+        switch controller.status {
+        case .stopped:
+            if let grey = greyscale(image: baseImage) {
+                iconImage = grey
+            } else {
+                iconImage = baseImage ?? NSImage(named: "menubar-icon") ?? NSImage()
+            }
+        case .monitoring:
+            // Blue tint for monitoring mode
+            if let tinted = tintImage(image: baseImage, color: .systemBlue) {
+                iconImage = tinted
+            } else {
+                iconImage = baseImage ?? NSImage(named: "menubar-icon") ?? NSImage()
+            }
+        default:
             iconImage = baseImage ?? NSImage(named: "menubar-icon") ?? NSImage()
         }
         return Image(nsImage: iconImage)
@@ -115,6 +133,31 @@ struct EXOApp: App {
         filter.saturation = 0
         filter.brightness = -0.2
         filter.contrast = 0.9
+
+        guard let output = filter.outputImage,
+            let rendered = ciContext.createCGImage(output, from: output.extent)
+        else {
+            return nil
+        }
+
+        return NSImage(cgImage: rendered, size: image.size)
+    }
+
+    private func tintImage(image: NSImage?, color: NSColor) -> NSImage? {
+        guard
+            let image,
+            let tiff = image.tiffRepresentation,
+            let bitmap = NSBitmapImageRep(data: tiff),
+            let cgImage = bitmap.cgImage
+        else {
+            return nil
+        }
+
+        let ciImage = CIImage(cgImage: cgImage)
+        let filter = CIFilter.colorControls()
+        filter.inputImage = ciImage
+        filter.saturation = 1.2
+        filter.brightness = 0.1
 
         guard let output = filter.outputImage,
             let rendered = ciContext.createCGImage(output, from: output.extent)

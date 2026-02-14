@@ -1,0 +1,36 @@
+[package]
+name = "ios_bindings"
+version = { workspace = true }
+edition = { workspace = true }
+publish = false
+
+[lib]
+name = "exo_networking"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# workspace dependencies
+networking = { workspace = true }
+util = { workspace = true }
+
+# async
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
+futures = { workspace = true }
+
+# logging
+log = { workspace = true }
+oslog = "0.2"
+
+# networking
+libp2p = { workspace = true, features = ["gossipsub", "noise", "tcp", "yamux", "pnet", "macros", "tokio"] }
+
+# utilities
+keccak-const = { workspace = true }
+once_cell = { workspace = true }
+
+[build-dependencies]
+cbindgen = "0.28"

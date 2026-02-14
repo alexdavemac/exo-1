@@ -390,5 +390,10 @@ def apply_topology_edge_created(event: TopologyEdgeCreated, state: State) -> Sta
 def apply_topology_edge_deleted(event: TopologyEdgeDeleted, state: State) -> State:
     topology = copy.deepcopy(state.topology)
     topology.remove_connection(event.conn)
-    # TODO: Clean up removing the reverse connection
+    reverse_conn = Connection(
+        source=event.conn.sink,
+        sink=event.conn.source,
+        edge=event.conn.edge,
+    )
+    topology.remove_connection(reverse_conn)
     return state.model_copy(update={"topology": topology})

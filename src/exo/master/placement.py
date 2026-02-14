@@ -11,6 +11,7 @@ from exo.master.placement_utils import (
     get_mlx_ring_hosts_by_node,
     get_shard_assignments,
     get_smallest_cycles,
+    select_jaccl_coordinator,
 )
 from exo.shared.models.model_cards import ModelId
 from exo.shared.topology import Topology
@@ -102,11 +103,13 @@ def place_instance(
             raise ValueError(
                 f"Requested Tensor sharding but this model does not support tensor parallelism: {command.model_card.model_id}"
             )
-        # TODO: the condition here for tensor parallel is not correct, but it works good enough for now.
+        # Tensor parallel requires hidden_size to be divisible by world_size for weight sharding,
+        # and world_size must be a power of 2 for efficient all-reduce operations.
         cycles_with_sufficient_memory = [
             cycle
             for cycle in cycles_with_sufficient_memory
             if command.model_card.hidden_size % len(cycle) == 0
+            and (len(cycle) & (len(cycle) - 1)) == 0  # world_size must be power of 2
         ]
         if not cycles_with_sufficient_memory:
             raise ValueError(
@@ -174,8 +177,9 @@ def place_instance(
                 [node_id for node_id in selected_cycle],
                 cycle_digraph,
             )
+            jaccl_coordinator = select_jaccl_coordinator(cycle_digraph, node_network)
             mlx_jaccl_coordinators = get_mlx_jaccl_coordinators(
-                coordinator=selected_cycle.node_ids[0],
+                coordinator=jaccl_coordinator,
                 coordinator_port=random_ephemeral_port(),
                 cycle_digraph=cycle_digraph,
                 node_network=node_network,

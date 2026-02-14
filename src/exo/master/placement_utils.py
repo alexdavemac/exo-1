@@ -414,6 +414,34 @@ def get_mlx_ring_hosts_by_node(
     return hosts_by_node
 
 
+def select_jaccl_coordinator(
+    cycle_digraph: Topology,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> NodeId:
+    """Select the best coordinator for JACCL by picking the node reachable by all others.
+
+    Falls back to first node if all candidates are equally reachable.
+    """
+    nodes = cycle_digraph.list_nodes()
+    best_candidate = nodes[0]
+    best_reachable_count = 0
+
+    for candidate in nodes:
+        reachable_count = sum(
+            1
+            for other in nodes
+            if other == candidate
+            or _find_ip_prioritised(other, candidate, cycle_digraph, node_network) is not None
+        )
+        if reachable_count > best_reachable_count:
+            best_reachable_count = reachable_count
+            best_candidate = candidate
+        if reachable_count == len(nodes):
+            break  # Fully reachable, no need to check further
+
+    return best_candidate
+
+
 def get_mlx_jaccl_coordinators(
     coordinator: NodeId,
     coordinator_port: int,

@@ -27,6 +27,7 @@ struct ContentView: View {
     @State private var pendingNamespace: String = ""
     @State private var pendingHFToken: String = ""
     @State private var pendingEnableImageModels = false
+    @State private var pendingAPIPort: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -64,8 +65,9 @@ struct ContentView: View {
         // the permission prompt, so this correctly handles both:
         // 1. User denied permission on first launch
         // 2. Permission broke after restart (macOS TCC bug)
+        // Don't show for monitoring mode since we're not managing the process
         if case .notWorking = localNetworkChecker.status {
-            return controller.status != .stopped
+            return controller.status == .running || controller.status == .starting
         }
         return false
     }
@@ -285,6 +287,46 @@ struct ContentView: View {
             .animation(nil, value: showAdvanced)
             if showAdvanced {
                 VStack(alignment: .leading, spacing: 8) {
+                    // Monitoring mode indicator
+                    if controller.isMonitoringExternal {
+                        HStack(spacing: 6) {
+                            Image(systemName: "link.circle.fill")
+                                .foregroundColor(.blue)
+                            Text("Monitoring external exo instance")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    // API Port configuration
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("API Port")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        HStack {
+                            TextField("52415", text: $pendingAPIPort)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption2)
+                                .frame(width: 80)
+                                .onAppear {
+                                    pendingAPIPort = String(controller.apiPort)
+                                }
+                            Button("Apply") {
+                                if let port = Int(pendingAPIPort), port > 0 && port < 65536 {
+                                    controller.apiPort = port
+                                    stateService.updateBaseURL(controller.apiBaseURL)
+                                    // Reconnect with new port
+                                    Task {
+                                        await controller.smartLaunch()
+                                    }
+                                    stateService.startPolling()
+                                }
+                            }
+                            .font(.caption2)
+                            .disabled(pendingAPIPort == String(controller.apiPort))
+                            Spacer()
+                        }
+                    }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Cluster Namespace")
                             .font(.caption2)
@@ -303,7 +345,7 @@ struct ContentView: View {
                                 }
                             }
                             .font(.caption2)
-                            .disabled(pendingNamespace == controller.customNamespace)
+                            .disabled(pendingNamespace == controller.customNamespace || controller.isMonitoringExternal)
                         }
                     }
                     VStack(alignment: .leading, spacing: 4) {
@@ -372,7 +414,7 @@ struct ContentView: View {
 
     private var dashboardButton: some View {
         Button {
-            guard let url = URL(string: "http://localhost:52415/") else { return }
+            guard let url = URL(string: "http://localhost:\(controller.apiPort)/") else { return }
             NSWorkspace.shared.open(url)
         } label: {
             HStack {
@@ -415,7 +457,7 @@ struct ContentView: View {
     }
 
     private var shouldShowClusterDetails: Bool {
-        controller.status != .stopped
+        controller.status.isConnected
     }
 
     private var shouldShowInstances: Bool {
@@ -431,6 +473,8 @@ struct ContentView: View {
                 return "Launching in \(countdown)s"
             }
             return nil
+        case .monitoring:
+            return "Connected to port \(controller.apiPort)"
         default:
             if let countdown = controller.launchCountdownSeconds {
                 return "Launching in \(countdown)s"
@@ -650,7 +694,7 @@ struct ContentView: View {
         Binding(
             get: {
                 switch controller.status {
-                case .running, .starting:
+                case .running, .starting, .monitoring:
                     return true
                 case .stopped, .failed:
                     return false
@@ -661,10 +705,19 @@ struct ContentView: View {
                     stateService.resetTransientState()
                     stateService.startPolling()
                     controller.cancelPendingLaunch()
-                    controller.launchIfNeeded()
+                    if controller.isMonitoringExternal {
+                        // Re-enter monitoring mode (just starts polling)
+                        controller.enterMonitoringMode()
+                    } else {
+                        controller.launchIfNeeded()
+                    }
                 } else {
                     stateService.stopPolling()
-                    controller.stop()
+                    if controller.isMonitoringExternal {
+                        controller.exitMonitoringMode()
+                    } else {
+                        controller.stop()
+                    }
                     stateService.resetTransientState()
                 }
             }

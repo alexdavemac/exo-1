@@ -86,6 +86,81 @@
     return { label: "?", missing: true };
   }
 
+  // ─── Connection Type Classification ───────────────────────────────
+  type ConnectionType = "thunderbolt" | "ethernet" | "wifi" | "unknown";
+
+  interface ConnectionTypeStyle {
+    color: string;
+    dashArray: string;
+    label: string;
+    icon: string;
+  }
+
+  const CONNECTION_STYLES: Record<ConnectionType, ConnectionTypeStyle> = {
+    thunderbolt: {
+      color: "#F59E0B",     // Amber/gold — Thunderbolt
+      dashArray: "none",     // Solid line for fastest link
+      label: "Thunderbolt",
+      icon: "⚡",
+    },
+    ethernet: {
+      color: "#3B82F6",     // Blue — Ethernet
+      dashArray: "8, 3",    // Long dash
+      label: "Ethernet",
+      icon: "🔗",
+    },
+    wifi: {
+      color: "#10B981",     // Green — Wi-Fi
+      dashArray: "3, 3",    // Short dash
+      label: "Wi-Fi",
+      icon: "📡",
+    },
+    unknown: {
+      color: "#B3B3B3",     // Gray — Unknown/fallback
+      dashArray: "4, 4",    // Default dashed
+      label: "Unknown",
+      icon: "?",
+    },
+  };
+
+  function classifyInterface(ifaceLabel: string): ConnectionType {
+    if (!ifaceLabel || ifaceLabel === "?") return "unknown";
+    const lower = ifaceLabel.toLowerCase();
+
+    // Thunderbolt interfaces (bridge100, bridge0, thunderbolt0, etc.)
+    if (lower.includes("thunder") || lower.includes("bridge")) return "thunderbolt";
+
+    // Ethernet interfaces (en0 wired, en1 wired, eth0, etc.)
+    // Note: en0 on Mac can be Wi-Fi on laptops but wired on desktops
+    // We classify enX with low numbers as ethernet (Mac Minis/Studios use en0 for ethernet)
+    if (lower.startsWith("eth")) return "ethernet";
+    if (lower.match(/^en\d+$/)) return "ethernet";
+
+    // Wi-Fi interfaces (typically named "Wi-Fi", "wlan0", "airport", etc.)
+    if (lower.includes("wi-fi") || lower.includes("wifi") || lower.includes("wlan") || lower.includes("airport")) return "wifi";
+
+    // awdl/llw are Apple Wireless Direct Link — treat as wifi-class
+    if (lower.startsWith("awdl") || lower.startsWith("llw")) return "wifi";
+
+    return "unknown";
+  }
+
+  /**
+   * Determine the best connection type for a pair of nodes based on their edges.
+   * Priority: thunderbolt > ethernet > wifi > unknown
+   */
+  function bestConnectionType(connections: ConnectionInfo[]): ConnectionType {
+    const priority: ConnectionType[] = ["thunderbolt", "ethernet", "wifi", "unknown"];
+    let best: ConnectionType = "unknown";
+    for (const conn of connections) {
+      const ct = classifyInterface(conn.ifaceLabel);
+      if (priority.indexOf(ct) < priority.indexOf(best)) {
+        best = ct;
+      }
+    }
+    return best;
+  }
+
   function wrapLine(text: string, maxLen: number): string[] {
     if (text.length <= maxLen) return [text];
     const words = text.split(" ");
@@ -194,25 +269,32 @@
     glowMerge.append("feMergeNode").attr("in", "coloredBlur");
     glowMerge.append("feMergeNode").attr("in", "SourceGraphic");
 
-    // Arrowhead marker for directional edges
-    const marker = defs
-      .append("marker")
-      .attr("id", "arrowhead")
-      .attr("viewBox", "0 0 10 10")
-      .attr("refX", "10")
-      .attr("refY", "5")
-      .attr("markerWidth", "11")
-      .attr("markerHeight", "11")
-      .attr("orient", "auto-start-reverse");
-    marker
-      .append("path")
-      .attr("d", "M 0 0 L 10 5 L 0 10")
-      .attr("fill", "none")
-      .attr("stroke", "var(--exo-light-gray, #B3B3B3)")
-      .attr("stroke-width", "1.6")
-      .attr("stroke-linecap", "round")
-      .attr("stroke-linejoin", "round")
-      .style("animation", "none");
+    // Arrowhead markers — one per connection type + default fallback
+    function addArrowMarker(id: string, color: string) {
+      const m = defs
+        .append("marker")
+        .attr("id", id)
+        .attr("viewBox", "0 0 10 10")
+        .attr("refX", "10")
+        .attr("refY", "5")
+        .attr("markerWidth", "11")
+        .attr("markerHeight", "11")
+        .attr("orient", "auto-start-reverse");
+      m.append("path")
+        .attr("d", "M 0 0 L 10 5 L 0 10")
+        .attr("fill", "none")
+        .attr("stroke", color)
+        .attr("stroke-width", "1.6")
+        .attr("stroke-linecap", "round")
+        .attr("stroke-linejoin", "round")
+        .style("animation", "none");
+    }
+    // Default (legacy)
+    addArrowMarker("arrowhead", "var(--exo-light-gray, #B3B3B3)");
+    // Per-type arrows
+    for (const [ctKey, style] of Object.entries(CONNECTION_STYLES)) {
+      addArrowMarker(`arrowhead-${ctKey}`, style.color);
+    }
 
     if (nodeIds.length === 0) {
       svg
@@ -362,19 +444,38 @@
       pairMap.set(key, entry);
     });
 
+    // Track which connection types are actually used (for the legend)
+    const usedConnectionTypes = new Set<ConnectionType>();
+
     pairMap.forEach((entry) => {
       const posA = positionById[entry.a];
       const posB = positionById[entry.b];
       if (!posA || !posB) return;
 
-      // Base dashed line
-      linksGroup
+      // Determine connection type for this edge pair
+      const connType = bestConnectionType(entry.connections);
+      const style = CONNECTION_STYLES[connType];
+      usedConnectionTypes.add(connType);
+
+      // Colored, styled edge line
+      const line = linksGroup
         .append("line")
         .attr("x1", posA.x)
         .attr("y1", posA.y)
         .attr("x2", posB.x)
         .attr("y2", posB.y)
-        .attr("class", "graph-link");
+        .attr("stroke", style.color)
+        .attr("stroke-width", connType === "thunderbolt" ? 1.5 : 1)
+        .attr("opacity", 0.85);
+
+      if (style.dashArray !== "none") {
+        line.attr("stroke-dasharray", style.dashArray);
+        // Animate dashed lines
+        line.style("animation", "flowAnimation 0.75s linear infinite");
+      } else {
+        // Solid line with subtle glow for Thunderbolt
+        line.attr("filter", "url(#glow)");
+      }
 
       // Calculate midpoint and direction for arrows
       const dx = posB.x - posA.x;
@@ -386,6 +487,8 @@
       const my = (posA.y + posB.y) / 2;
       const tipOffset = 16; // Distance from center for arrow tips
       const carrier = 2; // Short segment length for arrow orientation
+
+      const arrowMarkerId = `arrowhead-${connType}`;
 
       // Arrow A -> B (if connection exists in that direction)
       if (entry.aToB) {
@@ -399,7 +502,7 @@
           .attr("y2", tipY)
           .attr("stroke", "none")
           .attr("fill", "none")
-          .attr("marker-end", "url(#arrowhead)");
+          .attr("marker-end", `url(#${arrowMarkerId})`);
       }
 
       // Arrow B -> A (if connection exists in that direction)
@@ -414,7 +517,25 @@
           .attr("y2", tipY)
           .attr("stroke", "none")
           .attr("fill", "none")
-          .attr("marker-end", "url(#arrowhead)");
+          .attr("marker-end", `url(#${arrowMarkerId})`);
+      }
+
+      // Connection type label at midpoint (always visible, not just debug)
+      if (!isMinimized && entry.connections.length > 0) {
+        // Perpendicular offset so the label doesn't overlap the line
+        const perpX = -uy * 10;
+        const perpY = ux * 10;
+        linksGroup
+          .append("text")
+          .attr("x", mx + perpX)
+          .attr("y", my + perpY)
+          .attr("text-anchor", "middle")
+          .attr("dominant-baseline", "middle")
+          .attr("font-size", 8)
+          .attr("font-family", "SF Mono, Monaco, monospace")
+          .attr("fill", style.color)
+          .attr("opacity", 0.9)
+          .text(style.label);
       }
 
       // Collect debug labels for later positioning at edges
@@ -493,7 +614,9 @@
         quadrantEdges.forEach((edge) => {
           edge.connections.forEach((conn) => {
             const arrow = getArrow(conn.from, conn.to);
-            const label = `${arrow} ${conn.ip} ${conn.ifaceLabel}`;
+            const ct = classifyInterface(conn.ifaceLabel);
+            const ctStyle = CONNECTION_STYLES[ct];
+            const label = `${arrow} ${conn.ip} ${conn.ifaceLabel} [${ctStyle.label}]`;
             debugLabelsGroup
               .append("text")
               .attr("x", baseX)
@@ -506,12 +629,59 @@
                 "fill",
                 conn.missingIface
                   ? "rgba(248,113,113,0.9)"
-                  : "rgba(255,255,255,0.85)",
+                  : ctStyle.color,
               )
               .text(label);
             currentY += isTop ? lineHeight : -lineHeight;
           });
         });
+      });
+    }
+
+    // ─── Connection Type Legend ────────────────────────────────────────
+    if (!isMinimized && usedConnectionTypes.size > 0) {
+      const legendGroup = svg.append("g").attr("class", "connection-legend");
+      const legendX = 12;
+      const legendY = height - 12;
+      const legendFontSize = 9;
+      const legendLineLen = 18;
+      const legendRowHeight = 14;
+
+      // Build from bottom-up so it anchors to bottom-left
+      const types = Array.from(usedConnectionTypes).sort((a, b) => {
+        const order: ConnectionType[] = ["thunderbolt", "ethernet", "wifi", "unknown"];
+        return order.indexOf(a) - order.indexOf(b);
+      });
+
+      types.forEach((ct, i) => {
+        const s = CONNECTION_STYLES[ct];
+        const rowY = legendY - (types.length - 1 - i) * legendRowHeight;
+
+        // Sample line
+        const sampleLine = legendGroup
+          .append("line")
+          .attr("x1", legendX)
+          .attr("y1", rowY)
+          .attr("x2", legendX + legendLineLen)
+          .attr("y2", rowY)
+          .attr("stroke", s.color)
+          .attr("stroke-width", ct === "thunderbolt" ? 1.5 : 1)
+          .attr("opacity", 0.9);
+        if (s.dashArray !== "none") {
+          sampleLine.attr("stroke-dasharray", s.dashArray);
+        }
+
+        // Label
+        legendGroup
+          .append("text")
+          .attr("x", legendX + legendLineLen + 6)
+          .attr("y", rowY)
+          .attr("dominant-baseline", "middle")
+          .attr("font-size", legendFontSize)
+          .attr("font-family", "SF Mono, Monaco, monospace")
+          .attr("fill", s.color)
+          .attr("opacity", 0.85)
+          .text(s.label);
       });
     }
 
@@ -1233,6 +1403,7 @@
     transition: opacity 0.2s ease;
   }
   :global(.graph-link) {
+    /* Legacy fallback — edges now styled inline per connection type */
     stroke: var(--exo-light-gray, #b3b3b3);
     stroke-width: 1px;
     stroke-dasharray: 4, 4;

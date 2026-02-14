@@ -12,8 +12,8 @@ final class ClusterStateService: ObservableObject {
     private var timer: Timer?
     private let decoder: JSONDecoder
     private let session: URLSession
-    private let baseURL: URL
-    private let endpoint: URL
+    private var baseURL: URL
+    private var endpoint: URL
 
     init(
         baseURL: URL = URL(string: "http://127.0.0.1:52415")!,
@@ -25,6 +25,12 @@ final class ClusterStateService: ObservableObject {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         self.decoder = decoder
+    }
+
+    func updateBaseURL(_ newURL: URL) {
+        baseURL = newURL
+        endpoint = newURL.appendingPathComponent("state")
+        resetTransientState()
     }
 
     func startPolling(interval: TimeInterval = 0.5) {

@@ -5,6 +5,7 @@ import Foundation
 private let customNamespaceKey = "EXOCustomNamespace"
 private let hfTokenKey = "EXOHFToken"
 private let enableImageModelsKey = "EXOEnableImageModels"
+private let apiPortKey = "EXOAPIPort"
 
 @MainActor
 final class ExoProcessController: ObservableObject {
@@ -12,6 +13,7 @@ final class ExoProcessController: ObservableObject {
         case stopped
         case starting
         case running
+        case monitoring  // Connected to externally-managed exo instance
         case failed(message: String)
 
         var displayText: String {
@@ -22,8 +24,19 @@ final class ExoProcessController: ObservableObject {
                 return "Starting…"
             case .running:
                 return "Running"
+            case .monitoring:
+                return "Monitoring"
             case .failed:
                 return "Failed"
+            }
+        }
+
+        var isConnected: Bool {
+            switch self {
+            case .running, .monitoring:
+                return true
+            default:
+                return false
             }
         }
     }
@@ -33,6 +46,7 @@ final class ExoProcessController: ObservableObject {
     }()
 
     @Published private(set) var status: Status = .stopped
+    @Published private(set) var isMonitoringExternal: Bool = false
     @Published private(set) var lastError: String?
     @Published private(set) var launchCountdownSeconds: Int?
     @Published var customNamespace: String = {
@@ -58,6 +72,19 @@ final class ExoProcessController: ObservableObject {
         didSet {
             UserDefaults.standard.set(enableImageModels, forKey: enableImageModelsKey)
         }
+    }
+    @Published var apiPort: Int = {
+        let saved = UserDefaults.standard.integer(forKey: apiPortKey)
+        return saved > 0 ? saved : 52415
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(apiPort, forKey: apiPortKey)
+        }
+    }
+
+    var apiBaseURL: URL {
+        URL(string: "http://127.0.0.1:\(apiPort)")!
     }
 
     private var process: Process?
@@ -169,6 +196,50 @@ final class ExoProcessController: ObservableObject {
         launchCountdownSeconds = nil
     }
 
+    /// Check if an external exo instance is already running on the configured port
+    func checkForExternalInstance() async -> Bool {
+        let url = apiBaseURL.appendingPathComponent("node_id")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2.0
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse,
+               (200..<300).contains(httpResponse.statusCode) {
+                return true
+            }
+        } catch {
+            // API not responding - no external instance
+        }
+        return false
+    }
+
+    /// Enter monitoring mode for an externally-managed exo instance
+    func enterMonitoringMode() {
+        cancelPendingLaunch()
+        stop()
+        isMonitoringExternal = true
+        status = .monitoring
+    }
+
+    /// Exit monitoring mode
+    func exitMonitoringMode() {
+        isMonitoringExternal = false
+        if status == .monitoring {
+            status = .stopped
+        }
+    }
+
+    /// Smart launch that checks for external instance first
+    func smartLaunch() async {
+        if await checkForExternalInstance() {
+            enterMonitoringMode()
+        } else {
+            launch()
+        }
+    }
+
     func revealRuntimeDirectory() {
         guard let runtimeDirectoryURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([runtimeDirectoryURL])
@@ -178,6 +249,8 @@ final class ExoProcessController: ObservableObject {
         switch status {
         case .running:
             return .systemGreen
+        case .monitoring:
+            return .systemBlue
         case .starting:
             return .systemYellow
         case .failed:

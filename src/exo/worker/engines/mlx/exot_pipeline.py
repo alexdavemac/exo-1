@@ -17,6 +17,7 @@ Protocol Wire Format:
 """
 
 import json
+import os as _os
 import socket
 import struct
 import threading
@@ -34,6 +35,10 @@ EXOT_MAGIC = 0x45584F54  # "EXOT" in ASCII
 EXOT_VERSION = 1
 EXOT_DEFAULT_PORT = 52414
 EXOT_HEADER_MIN_SIZE = 24
+
+# FP16 Compression — cast float32 activations to float16 before transfer,
+# cutting bandwidth by 50%. Set EXO_EXOT_FP16=0 to disable.
+EXOT_FP16_COMPRESS = _os.environ.get("EXO_EXOT_FP16", "1") != "0"
 
 
 class MessageType(IntEnum):
@@ -296,26 +301,47 @@ class ExotClient:
             logger.error(f"[EXOT] Sync failed: {e}")
             return False
 
-    def send_activation(self, activation: mx.array) -> mx.array | None:
+    def send_activation(
+        self,
+        activation: mx.array,
+        *,
+        compress_fp16: bool | None = None,
+    ) -> mx.array | None:
         """
         Send activation tensor to iOS and receive processed result.
 
-        This is the main tensor exchange method used during inference.
-        The Mac sends intermediate activations, iOS processes them through
-        its assigned layers, and returns the result.
+        When FP16 compression is enabled (default), float32 activations are
+        cast to float16 before serialisation — halving wire bytes.  The
+        received result is cast back to the original dtype automatically.
+
+        Args:
+            activation: The intermediate activation tensor.
+            compress_fp16: Override the global EXOT_FP16_COMPRESS flag for this call.
         """
         if not self._connected or not self._socket:
             raise RuntimeError("Not connected to iOS TensorServer")
 
+        should_compress = compress_fp16 if compress_fp16 is not None else EXOT_FP16_COMPRESS
+        original_dtype = activation.dtype
+
         with self._lock:
             try:
-                # Create activation message
-                msg = TensorMessage.from_array(MessageType.ACTIVATION, activation)
+                # ── FP16 compression: cast before serialisation ──
+                send_tensor = activation
+                if should_compress and original_dtype == mx.float32:
+                    send_tensor = activation.astype(mx.float16)
 
-                # Send activation
+                msg = TensorMessage.from_array(MessageType.ACTIVATION, send_tensor)
                 wire_data = msg.serialize()
                 self._send_raw(wire_data)
-                logger.debug(f"[EXOT] Sent activation: shape={activation.shape}, {len(wire_data)} bytes")
+
+                if should_compress and original_dtype == mx.float32:
+                    logger.debug(
+                        f"[EXOT] Sent FP16-compressed activation: shape={activation.shape}, "
+                        f"{len(wire_data)} bytes (was {activation.nbytes} fp32)"
+                    )
+                else:
+                    logger.debug(f"[EXOT] Sent activation: shape={activation.shape}, {len(wire_data)} bytes")
 
                 # Receive result
                 response = self._receive_message()
@@ -330,6 +356,11 @@ class ExotClient:
                     raise RuntimeError(f"Unexpected message type: {response.msg_type}")
 
                 result = response.to_array()
+
+                # ── Restore original dtype if we compressed ──
+                if should_compress and result.dtype != original_dtype:
+                    result = result.astype(original_dtype)
+
                 logger.debug(f"[EXOT] Received result: shape={result.shape}")
                 return result
 

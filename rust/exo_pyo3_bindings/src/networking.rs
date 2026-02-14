@@ -159,6 +159,7 @@ async fn networking_task(
     mut to_task_rx: mpsc::Receiver<ToTask>,
     connection_update_tx: mpsc::Sender<PyConnectionUpdate>,
     gossipsub_message_tx: mpsc::Sender<(String, Vec<u8>)>,
+    listen_address_tx: mpsc::Sender<String>,
     shutdown_signal: Arc<AtomicBool>,
 ) {
     use SwarmEvent::*;
@@ -332,8 +333,16 @@ async fn networking_task(
                             continue;
                         }
                     },
+                    NewListenAddr { address, .. } => {
+                        let addr_str = address.to_string();
+                        log::info!("RUST: listening on {addr_str}");
+                        // Send listen address through channel
+                        if let Err(e) = listen_address_tx.send(addr_str).await {
+                            log::error!("RUST: could not send listen address: {e}");
+                        }
+                    },
                     e => {
-                        log::info!("RUST: other event {e:?}");
+                        log::debug!("RUST: other event {e:?}");
                     }
                 }
             }
@@ -351,6 +360,8 @@ async fn networking_task(
     if let Some(tx) = gossipsub_message_tx.take() {
         std::mem::forget(tx);
     }
+    // Also forget listen_address_tx
+    std::mem::forget(listen_address_tx);
 
     log::info!("RUST: networking task stopped");
 }
@@ -363,6 +374,9 @@ struct PyNetworkingHandle {
     to_task_tx: Option<mpsc::Sender<ToTask>>,
     connection_update_rx: Mutex<mpsc::Receiver<PyConnectionUpdate>>,
     gossipsub_message_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
+    // listen addresses (multiaddrs as strings)
+    listen_addresses: Mutex<Vec<String>>,
+    listen_addresses_rx: Mutex<mpsc::Receiver<String>>,
     // shutdown coordination
     shutdown_signal: Arc<AtomicBool>,
     task_handle: Option<JoinHandle<()>>,
@@ -393,6 +407,7 @@ impl PyNetworkingHandle {
         to_task_tx: mpsc::Sender<ToTask>,
         connection_update_rx: mpsc::Receiver<PyConnectionUpdate>,
         gossipsub_message_rx: mpsc::Receiver<(String, Vec<u8>)>,
+        listen_addresses_rx: mpsc::Receiver<String>,
         shutdown_signal: Arc<AtomicBool>,
         task_handle: JoinHandle<()>,
     ) -> Self {
@@ -400,6 +415,8 @@ impl PyNetworkingHandle {
             to_task_tx: Some(to_task_tx),
             connection_update_rx: Mutex::new(connection_update_rx),
             gossipsub_message_rx: Mutex::new(gossipsub_message_rx),
+            listen_addresses: Mutex::new(Vec::new()),
+            listen_addresses_rx: Mutex::new(listen_addresses_rx),
             shutdown_signal,
             task_handle: Some(task_handle),
         }
@@ -429,6 +446,7 @@ impl PyNetworkingHandle {
         let (to_task_tx, to_task_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
         let (connection_update_tx, connection_update_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
         let (gossipsub_message_tx, gossipsub_message_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
+        let (listen_addresses_tx, listen_addresses_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
 
         // create shutdown signal
         let shutdown_signal = Arc::new(AtomicBool::new(false));
@@ -449,6 +467,7 @@ impl PyNetworkingHandle {
                 to_task_rx,
                 connection_update_tx,
                 gossipsub_message_tx,
+                listen_addresses_tx,
                 shutdown_signal_clone,
             )
             .await;
@@ -457,6 +476,7 @@ impl PyNetworkingHandle {
             to_task_tx,
             connection_update_rx,
             gossipsub_message_rx,
+            listen_addresses_rx,
             shutdown_signal,
             task_handle,
         ))
@@ -674,6 +694,26 @@ impl PyNetworkingHandle {
     // fn gossipsub_len(&self) -> usize {
     //     self.gossipsub_message_rx.blocking_lock().len()
     // }
+
+    // ---- Listen addresses methods ----
+
+    /// Returns all listen addresses as multiaddr strings.
+    /// This drains any newly received addresses from the channel and returns
+    /// the accumulated list of all addresses.
+    fn get_listen_addresses(&self) -> PyResult<Vec<String>> {
+        // First, drain any new addresses from the channel
+        let mut rx = self.listen_addresses_rx.blocking_lock();
+        let mut addrs = self.listen_addresses.blocking_lock();
+
+        // Try to receive all pending addresses without blocking
+        while let Ok(addr) = rx.try_recv() {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+
+        Ok(addrs.clone())
+    }
 }
 
 pub fn networking_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
